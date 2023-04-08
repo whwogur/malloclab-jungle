@@ -42,7 +42,7 @@ team_t team = {
 /* 기본 단위인 word, double word, 새로 할당받는 힙의 크기 CHUNKSIZE를 정의한다 */
 #define WSIZE       4       /* Word and header/footer size (bytes) */
 #define DSIZE       8       /* Double word size (bytes) */
-#define UNIT        16      /* Initial Prologue block size, header, footer, PREC, SUCC */
+#define MINIMUM        16      /* Initial Prologue block size, header, footer, PREC, SUCC */
 #define CHUNKSIZE   (1<<12) /* Extend heap by this amount : 4096bytes -> 4kib */
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))  // 최댓값 구하는 함수 매크로
@@ -90,10 +90,10 @@ int mm_init(void) {
         return -1;
 
     PUT(heap_listp, 0);  // Alignment padding. 더블 워드 경계로 정렬된 미사용 패딩.
-    PUT(heap_listp + (1 * WSIZE), PACK(UNIT, 1));  // prologue header
+    PUT(heap_listp + (1 * WSIZE), PACK(MINIMUM, 1));  // prologue header
     PUT(heap_listp + (2 * WSIZE), NULL);  // prologue block안의 PREC 포인터 NULL로 초기화
     PUT(heap_listp + (3 * WSIZE), NULL);  // prologue block안의 SUCC 포인터 NULL로 초기화
-    PUT(heap_listp + (4 * WSIZE), PACK(UNIT, 1));  // prologue footer
+    PUT(heap_listp + (4 * WSIZE), PACK(MINIMUM, 1));  // prologue footer
     PUT(heap_listp + (5 * WSIZE), PACK(0, 1));      // epliogue header
 
     free_listp = heap_listp + 2 * WSIZE; // free_listp를 탐색의 시작점으로 둔다. 
