@@ -2,16 +2,25 @@
  * mm.c - Malloc implementation using segregated fits with address-ordered
  *        explicit linked lists and reallocation heuristics
  *
- * Each block is wrapped in a 4-byte header and a 4-byte footer. Free blocks
- * are stored in one of many linked lists segregated by block size. The n-th
- * list contains blocks with a byte size that spans 2^n to 2^(n+1)-1. Within
- * each list, blocks are sorted by memory address in ascending order.
- * Coalescing is performed immediately after each heap extension and free
- * operation. Reallocation is performed in place, using a buffer and a
- * reallocation bit to ensure the availability of future block expansion.
- *
- * Header entries consist of the block size (all 32 bits), reallocation tag
- * (second-last bit), and allocation bit (last bit).
+ * 헤더는 총 32바이트 - REALLOCATION TAG 마지막에서 두번째 비트, 할당여부 비트 제일마지막
+ * 모든 블럭은 4바이트 헤더와 4바이트 경계태그(footer)로 싸여있음.
+ * 가용 블럭의 크기에 따라 링크ed 리스트를 나눠서 가용블럭을 넣어줬음.
+ *  예) n 번째 리스트는 바이트 사이즈가 2^n ~ 2^(n+1)-1 사이에 있는 것
+ * 리스트 안에서는 가용 블럭이 메모리 주소를 기준으로 오름차순 정렬되어있음.
+ * coalescing 정책 -> heap의 확장 또는 할당해제 시 coalesce함
+ * Reallocation은 reallocation 비트와 버퍼를 이용해 후에 블럭의 확장을 고려함.
+ * 
+ * REALLOCATION TAG의 필요성:
+ * 1. 성능 개선 - 메모리를 동적으로 할당하면서 재할당이 필요한 경우, 새로운 메모리 블록을 찾아야
+ * 하므로 시간이 더 걸린다, 그러나 reallocation tag를 사용하여 미리 재할당에 필요한 버퍼를 확보하면
+ * 재할당이 필요한 경우에 이미 확보된 버퍼를 사용할 수 있어서 성능이 개선된다
+ * 
+ * 2. 메모리 leak 방지 - 메모리를 동적으로 할당하면서 재할당이 필요한 경우, 기존의 메모리 블록을 해제하지 않으면
+ * 메모리 누수가 발생할 수 있다. Reallocation tag를 사용해 재할당에 필요한 버퍼를 미리 확보하면, 기존의 메모리 블럭을
+ * 해제하지 않고도 새로운 메모리 블럭을 할당할 수 있으므로 메모리 누수가 방지된다.
+ * 
+ * 3. 코드의 간소화 - 배열의 크기를 동적으로 변경하는 경우,reallocation tag를 이용해
+ * 새로운 배열의 크기를 미리 지정 해 놓으면 기존 배열에서 새로운 배열로 데이터를 복사하지 않아도 된다.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +41,7 @@ team_t team = {
     /* First member's full name */
     "whwogur",
     /* First member's email address */
-    "230410",
+    "230412",
     /* Second member's full name (leave blank if none) */
     "",
     /* Second member's email address (leave blank if none) */
@@ -71,7 +80,6 @@ static size_t SET_RATAG(void *p){ return GET(p) | 0x2;}
 // Preserve reallocation bit
 #define PUT(p, val)       (*(unsigned int *)(p) = (val) | GET_TAG(p))
 
-
 // Store predecessor or successor pointer for free blocks
 /*static  void SET_PTR(void *p, size_t ptr){
      *((size_t *)p) = (size_t ptr);
@@ -89,22 +97,22 @@ static size_t GET_TAG(void *p)  { return GET(p) & 0x2;}
 static void *HDRP(void *bp) { return ( (char *)bp) - WSIZE;}
 static  void *FTRP(void *bp) { return ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE);}
 
-// Address of (physically) next and previous blocks
-static void *NEXT_BLKP(void *ptr) { return  ((char *)(ptr) + GET_SIZE(((char *)(ptr) - WSIZE)));}
+// (물리적으로) 전 / 후 블럭
+static void* NEXT_BLKP(void *ptr) { return  ((char *)(ptr) + GET_SIZE(((char *)(ptr) - WSIZE)));}
 static  void* PREV_BLKP(void *ptr){ return  ((char *)(ptr) - GET_SIZE(((char *)(ptr) - DSIZE)));}
 
 // Address of free block's predecessor and successor entries
 static  void* PRED_PTR(void *ptr){ return ((char *)(ptr));}
 static  void* SUCC_PTR(void *ptr){ return ((char*)(ptr) + WSIZE);}
 
-// Address of free block's predecessor and successor on the segregated list
+// SEG리스트에서 블럭의 SUCC/PRED 주소
 static void* PRED(void *ptr){ return (*(char **)(ptr));}
 static void* SUCC(void *ptr){ return (*(char **)(SUCC_PTR(ptr)));}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // 전역변수
-void *segregated_free_lists[LISTLIMIT]; /* Array of pointers to segregated free lists */
+void *segregated_free_lists[LISTLIMIT]; /* seg. lists 가리키는 포인터's 배열 */
 
 
 // Functions
@@ -168,7 +176,7 @@ static void delete_node(void *ptr);
 static void *extend_heap(size_t size)
 {
     void *ptr;   /* Pointer to newly allocated memory */
-    size_t asize;  /*Adjusted size */
+    size_t asize;  /* 조정된 size */
     
     asize = ALIGN(size); /* Maintain alignment*/
     
@@ -189,24 +197,22 @@ static void *extend_heap(size_t size)
 }
 
 /*
- * insert_node - Insert a block pointer into a segregated list. Lists are
- *               segregated by byte size, with the n-th list spanning byte
- *               sizes 2^n to 2^(n+1)-1. Each individual list is sorted by
- *               pointer address in ascending order.
+ * insert_node - 가용 블럭의 크기에 따라 링크ed 리스트를 나눠서 가용블럭을 넣어줬음.
+ *  예) n 번째 리스트는 바이트 사이즈가 2^n ~ 2^(n+1)-1 사이에 있는 것
+ * 리스트 안에서는 가용 블럭이 메모리 주소를 기준으로 오름차순 정렬되어있음.
  */
 static void insert_node(void *ptr, size_t size) {
     int list = 0;
     void *search_ptr = ptr;
     void *insert_ptr = NULL;
     
-    /* Select segregated list*/
+    /* segregated list 크기 탐색*/
     while ((list < LISTLIMIT - 1) && (size > 1)) {
         size >>= 1;
         list++;
     }
     
-/* Select location on list to insert pointer while keeping list
-     organized by byte size in ascending order. */
+/* 포인터 삽입 할 위치 탐색 */
     search_ptr = segregated_free_lists[list];
     while ((search_ptr != NULL) && (size > GET_SIZE(HDRP(search_ptr)))) {
         insert_ptr = search_ptr;
@@ -245,9 +251,7 @@ static void insert_node(void *ptr, size_t size) {
 }
 
 /*
- * delete_node: Remove a free block pointer from a segregated list. If
- *              necessary, adjust pointers in predecessor and successor blocks
- *              or reset the list head.
+ * delete_node: 가용 블럭 포인터를 리스트에서 지운다. 전/후 블럭에 있는 포인터 또는 리스트 head조정.
  */
 
 static void delete_node(void *ptr) {
@@ -280,8 +284,7 @@ static void delete_node(void *ptr) {
 }
 
 /*
- * coalesce - Coalesce adjacent free blocks. Sort the new free block into the
- *            appropriate list.
+ * coalesce - 가용 블럭 합치고 맞는 리스트에 삽입
  */
 static void *coalesce(void *ptr)
 {
@@ -289,7 +292,7 @@ static void *coalesce(void *ptr)
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
     size_t size = GET_SIZE(HDRP(ptr));
     
-    // Do not coalesce with previous block if the previous block is tagged with Reallocation tag
+    // 이전 블럭에 Reallocation tag이 있다면 합치지 않는다.
     if (GET_TAG(HDRP(PREV_BLKP(ptr))))
         prev_alloc = 1;
     
@@ -297,7 +300,7 @@ static void *coalesce(void *ptr)
     if (prev_alloc && next_alloc) {
         return ptr;
     }
-    else if (prev_alloc && !next_alloc) {  /* Detect free blocks and merge, if possible */
+    else if (prev_alloc && !next_alloc) {  /* 주변 탐색 , coalesce 후 가용리스트에서 제거 */
         delete_node(ptr);
         delete_node(NEXT_BLKP(ptr));
         size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));
@@ -327,25 +330,24 @@ static void *coalesce(void *ptr)
 }
 
 /*
- * place - Set headers and footers for newly allocated blocks. Split blocks
- *         if enough space is remaining.
+ * place - 새로 할당되는 블럭의 헤더와 푸터 설정, 공간이 충분하다면 SPLIT
  */
 static void *place(void *ptr, size_t asize)
 {
     size_t ptr_size = GET_SIZE(HDRP(ptr));
     size_t remainder = ptr_size - asize;
     
-     /* Remove block from list */
+     /* 리스트에서 블럭 제거 */
     delete_node(ptr);
     
-    /* Do not split block*/
+    /* 공간이 충분하지 않으면 스플릿 X*/
     if (remainder <= DSIZE * 2) {
         PUT(HDRP(ptr), PACK(ptr_size, 1)); /* Block header */
         PUT(FTRP(ptr), PACK(ptr_size, 1)); /* Block footer */
     }
     
     else if (asize >= 100) {
-        /* split block */
+        /* SPLIT  */
         PUT(HDRP(ptr), PACK(remainder, 0)); /* Block header */
         PUT(FTRP(ptr), PACK(remainder, 0)); /* Block footer */
         PUT_NOTAG(HDRP(NEXT_BLKP(ptr)), PACK(asize, 1)); /* Next header */
@@ -414,11 +416,11 @@ int mm_init(void)
  *     Always allocate a block whose size is a multiple of the alignment.
  *
  * Role :
- * 1. The mm_malloc routine returns a pointer to an allocated block payload.
- * 2. The entire allocated block should lie within the heap region.
- * 3. The entire allocated block should overlap with any other chunk.
+ * 1. mm_malloc은 할당된 payload의 ptr을 리턴해준다.
+ * 2. 할당된 블럭은 힙 안에 위치해야한다.
+ * 3. 할당된 블럭은 다른 블럭과 겹치면 안된다.
  *
- * Return value : Always return the payload pointers that are alligned to 8 bytes.
+ * Return value : 항상 8바이트 정렬된 payload ptr 리턴한다.
  */
 void *mm_malloc(size_t size)
 {
@@ -438,12 +440,12 @@ void *mm_malloc(size_t size)
         asize = ALIGN(size+DSIZE);
     }
     
-    /* Select a free block of sufficient size from segregated list */
+    /* 리스트에서 알맞은 크기의 블럭 탐색 */
     size_t searchsize = asize;
     while (list < LISTLIMIT) {
         if ((list == LISTLIMIT - 1) || ((searchsize <= 1) && (segregated_free_lists[list] != NULL))) {
             ptr = segregated_free_lists[list];
-            // Ignore blocks that are too small or marked with the reallocation bit
+            // reallocation bit가 1이거나 사이즈가 부족한 블럭은 건너뛴다.
             while ((ptr != NULL) && ((asize > GET_SIZE(HDRP(ptr))) || (GET_TAG(HDRP(ptr)))))
             {
                 ptr = PRED(ptr);
@@ -456,7 +458,7 @@ void *mm_malloc(size_t size)
         list++;
     }
     
-    /* Extend the heap if no free blocks of sufficient size are found */
+    /* 알맞은 fit 못찾을 시 힙 늘린다 */
     if (ptr == NULL) {
         extendsize = MAX(asize, CHUNKSIZE);
         
@@ -466,7 +468,6 @@ void *mm_malloc(size_t size)
     
     /* Place and divide block */
     ptr = place(ptr, asize);
-    
     
     /* Return pointer to newly allocated block */
     return ptr;
@@ -480,7 +481,7 @@ void mm_free(void *ptr)
 {
     size_t size = GET_SIZE(HDRP(ptr)); /* Size of block */
     
-    REMOVE_RATAG(HDRP(NEXT_BLKP(ptr))); /* Unset the reallocation tag on the next block */
+    REMOVE_RATAG(HDRP(NEXT_BLKP(ptr))); /* 다음 블럭의 reallocation 블럭 초기화해준다 */
    
     /* 할당 상태 갱신 */
     PUT(HDRP(ptr), PACK(size, 0));
@@ -496,18 +497,12 @@ void mm_free(void *ptr)
 }
 
 /*
- * mm_realloc - Reallocate a block in place, extending the heap if necessary.
- *              The new block is padded with a buffer to guarantee that the
- *              next reallocation can be done without extending the heap,
- *              assuming that the block is expanded by a constant number of bytes
- *              per reallocation.
- *
- *              If the buffer is not large enough for the next reallocation,
- *              mark the next block with the reallocation tag. Free blocks
- *              marked with this tag cannot be used for allocation or
- *              coalescing. The tag is cleared when the marked block is
- *              consumed by reallocation, when the heap is extended, or when
- *              the reallocated block is freed.
+ * mm_realloc - 해당 블록이 재할당될 때 다음 재할당을 위해 필요한 버퍼 크기를 보장하기 위해 설정한다.
+ *              만약 새로운 할당된 블록에 버퍼가 충분하지 않다면, reallocation tag을 사용하여 다음 블록이 할당되지 않도록 표시한다.
+ *              Reallocation tag는 해당 블록이 재할당되거나 힙이 확장되거나 해당 블록이 해제될 때 자동으로 해제됩니다.
+ *              
+ *              만약 다음 재할당을 할 수 있을만큼 버퍼가 충분하지 않으면 다음 블럭의 reallocation tag을 설정해준다.
+ *              이 tag가 설정된 가용블럭은 할당이나 coalesce 할 수 없다. reallocation tag이 설정된 블럭이 재할당 되면 이 비트 0으로 바꿔줌.
  *       
  *            Implemented simply in terms of mm_malloc and mm_free
  *
@@ -517,17 +512,17 @@ void mm_free(void *ptr)
  */
 void *mm_realloc(void *ptr, size_t size)
 {
-    void *new_ptr = ptr;    /* Pointer to be returned */
-    size_t new_size = size; /* Size of new block */
-    int remainder;          /* Adequacy of block sizes */
-    int extendsize;         /* Size of heap extension */
-    int block_buffer;       /* Size of block buffer */
+    void *new_ptr = ptr;    /* 리턴 할 포인터 */
+    size_t new_size = size; /* 새로운 블럭의 크기 */
+    int remainder;          /* 남는 블럭 크기 */
+    int extendsize;         /* 힙 증가 크기 */
+    int block_buffer;       /* 버퍼 크기 */
     
     /* Ignore invalid block size */
     if (size == 0)
         return NULL;
     
-    /* Adjust block size to include boundary tag and alignment requirements */
+    /* 경계태그를 포함하고, 정렬조건에 맞게 조정 */
     if (new_size <= DSIZE) {
         new_size = 2 * DSIZE;
     } else {
@@ -556,7 +551,7 @@ void *mm_realloc(void *ptr, size_t size)
             
             // Do not split block
             PUT_NOTAG(HDRP(ptr), PACK(new_size + remainder, 1)); /* Block header */
-            PUT_NOTAG(FTRP(ptr), PACK(new_size + remainder, 1)); /* Block footre */
+            PUT_NOTAG(FTRP(ptr), PACK(new_size + remainder, 1)); /* Block footer */
         } else {
             new_ptr = mm_malloc(new_size - DSIZE);
             memcpy(new_ptr, ptr, MIN(size, new_size));
